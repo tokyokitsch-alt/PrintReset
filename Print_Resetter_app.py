@@ -10,7 +10,7 @@ st.set_page_config(page_title="PrintReset", layout="wide")
 
 st.title("PrintReset 📄✨")
 st.write(
-    "AI (Imagen) がプリントの手書き文字や影を取り除き、A4サイズに補正してリセットします。"
+    "AI (Gemini) がプリントの手書き文字や影を取り除き、A4サイズに補正してリセットします。"
 )
 
 # サイドバーにAPIキー設定
@@ -18,10 +18,9 @@ st.sidebar.header("設定")
 api_key = st.sidebar.text_input(
     "Gemini API Key", 
     type="password",
-    help="Google AI Studioで取得したAPIキーを入力してください。Streamlit Secretsに設定している場合は自動読み込みされます。"
+    help="Google AI Studioで取得したAPIキーを入力してください。"
 )
 
-# Secretsや環境変数からのフォールバック設定
 if not api_key:
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
@@ -63,30 +62,27 @@ if uploaded_file is not None:
             st.warning("⚠️ サイドバーに Gemini API Key を入力してください。")
         else:
             if st.button("AIでプリントをリセット実行", type="primary"):
-                with st.spinner("AIが手書き消去・歪み補正中..."):
+                with st.spinner("AIが処理中..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         
-                        # Imagen 3 APIによる画像生成処理
-                        result = client.models.generate_images(
-                            model="imagen-3.0-generate-002",
-                            prompt=f"Based on the original document context, output a clean printable worksheet: {PROMPT}",
-                            config=types.GenerateImagesConfig(
-                                number_of_images=1,
-                                output_mime_type="image/png",
-                                aspect_ratio="3:4"
-                            )
+                        # response_mime_type を指定せずに呼び出し
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=[image, PROMPT]
                         )
 
+                        # インラインデータ（画像データ）が含まれているか抽出
                         output_image = None
-                        if result.generated_images:
-                            generated_bytes = result.generated_images[0].image.image_bytes
-                            output_image = Image.open(io.BytesIO(generated_bytes))
-
+                        if response.candidates and response.candidates[0].content.parts:
+                            for part in response.candidates[0].content.parts:
+                                if part.inline_data:
+                                    output_image = Image.open(io.BytesIO(part.inline_data.data))
+                                    break
+                        
                         if output_image:
                             st.image(output_image, use_container_width=True)
                             
-                            # ダウンロード用に処理後の画像をバイト変換
                             buf = io.BytesIO()
                             output_image.save(buf, format="PNG")
                             byte_im = buf.getvalue()
@@ -98,7 +94,9 @@ if uploaded_file is not None:
                                 mime="image/png",
                             )
                         else:
-                            st.error("画像の生成に失敗しました。")
+                            st.warning("画像は出力されませんでした（テキスト応答のみ）。")
+                            if response.text:
+                                st.write(response.text)
 
                     except Exception as e:
                         st.error(f"エラーが発生しました: {e}")
