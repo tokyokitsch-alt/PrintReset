@@ -1,3 +1,7 @@
-git add requirements.txt
-git commit -m "feat: add requirements.txt"
-git push origin main
+Plaintext
+
+
+streamlit
+opencv-python-headless
+pillow
+numpy
