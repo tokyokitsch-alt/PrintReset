@@ -10,7 +10,7 @@ st.set_page_config(page_title="PrintReset", layout="wide")
 
 st.title("PrintReset 📄✨")
 st.write(
-    "AI (Gemini) がプリントの手書き文字や影を取り除き、A4サイズに補正してリセットします。"
+    "AI (Imagen) がプリントの手書き文字や影を取り除き、A4サイズに補正してリセットします。"
 )
 
 # サイドバーにAPIキー設定
@@ -67,22 +67,22 @@ if uploaded_file is not None:
                     try:
                         client = genai.Client(api_key=api_key)
                         
-                        # Geminiモデルに画像とプロンプトを送信
-                        response = client.models.generate_content(
-                            model="gemini-2.5-flash",
-                            contents=[image, PROMPT],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="image/png"
+                        # Imagen 3 APIによる画像生成処理
+                        result = client.models.generate_images(
+                            model="imagen-3.0-generate-002",
+                            prompt=f"Based on the original document context, output a clean printable worksheet: {PROMPT}",
+                            config=types.GenerateImagesConfig(
+                                number_of_images=1,
+                                output_mime_type="image/png",
+                                aspect_ratio="3:4"
                             )
                         )
 
-                        # 返却された画像を取り出す
                         output_image = None
-                        for part in response.candidates[0].content.parts:
-                            if part.inline_data:
-                                output_image = Image.open(io.BytesIO(part.inline_data.data))
-                                break
-                        
+                        if result.generated_images:
+                            generated_bytes = result.generated_images[0].image.image_bytes
+                            output_image = Image.open(io.BytesIO(generated_bytes))
+
                         if output_image:
                             st.image(output_image, use_container_width=True)
                             
@@ -99,8 +99,6 @@ if uploaded_file is not None:
                             )
                         else:
                             st.error("画像の生成に失敗しました。")
-                            if response.text:
-                                st.write(response.text)
 
                     except Exception as e:
                         st.error(f"エラーが発生しました: {e}")
