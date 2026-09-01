@@ -1,5 +1,7 @@
 import io
+import json
 import os
+import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
@@ -9,11 +11,9 @@ from google.genai import types
 st.set_page_config(page_title="PrintReset", layout="wide")
 
 st.title("PrintReset 📄✨")
-st.write(
-    "AI (Gemini) がプリントの手書き文字や影を取り除き、A4サイズに補正してリセットします。"
-)
+st.write("AI (Gemini) が手書き位置と歪みを解析し、OpenCVでA4プリントにきれい復元します。")
 
-# サイドバーにAPIキー設定
+# サイドバー
 st.sidebar.header("設定")
 api_key = st.sidebar.text_input(
     "Gemini API Key", 
@@ -31,24 +31,57 @@ uploaded_file = st.file_uploader(
     "プリントの画像をアップロードしてください", type=["png", "jpg", "jpeg"]
 )
 
-PROMPT = """
-1. Image Clean-up:
-- Remove all handwritten text, pencil marks, red pen annotations, and manual lines.
-- Keep all original printed text, kanji grid boxes, background tables, lines, and numbers perfectly clear and intact.
-- Ensure empty answer boxes (like [  ]) become completely blank and white inside.
+ANALYSIS_PROMPT = """
+Analyze this document image and return a JSON object with two fields:
+1. "corners": Normalized coordinates [y, x] scaled from 0 to 1000 for the 4 corners of the main worksheet page in order: [top-left, top-right, bottom-right, bottom-left].
+2. "handwriting_boxes": A list of bounding boxes [ymin, xmin, ymax, xmax] (scaled 0-1000) around ALL handwritten text, pencil marks, red/blue pen annotations, and manual drawings. Do NOT include original printed text, printed lines, or printed tables.
 
-2. Geometry & Layout Correction:
-- Straighten the paper perspective, remove any tilt/skew, and warp-correct to a flat top-down view.
-- Fit and adjust the document aspect ratio to standard A4 printable format with clean outer margins.
-
-3. Image Quality Enhancement:
-- Convert the paper background to a pure uniform white.
-- Remove shadows, lighting unevenness, and paper wrinkles.
-- Make all printed text and lines sharp, high-contrast, and dark grey/black for optimal printing.
+Return ONLY valid JSON.
 """
 
+def process_document(image_bytes, json_response):
+    # 画像読み込み
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    h, w, _ = img.shape
+
+    data = json.loads(json_response)
+    
+    # 1. 手書き文字部分を白で塗りつぶし
+    boxes = data.get("handwriting_boxes", [])
+    for box in boxes:
+        ymin, xmin, ymax, xmax = box
+        pt1 = (int(xmin * w / 1000), int(ymin * h / 1000))
+        pt2 = (int(xmax * w / 1000), int(ymax * h / 1000))
+        # 解答欄枠線を残しつつ内側を消去できるよう少し余白を調整
+        cv2.rectangle(img, pt1, pt2, (255, 255, 255), -1)
+
+    # 2. 台形補正 (Perspective Transform)
+    corners = data.get("corners", [])
+    if len(corners) == 4:
+        pts1 = np.float32([[c[1] * w / 1000, c[0] * h / 1000] for c in corners])
+        # A4縦サイズ比率 (例えば 1240 x 1754 px)
+        target_w, target_h = 1240, 1754
+        pts2 = np.float32([[0, 0], [target_w, 0], [target_w, target_h], [0, target_h]])
+        
+        M = cv2.getPerspectiveTransform(pts1, pts2)
+        img = cv2.warpPerspective(img, M, (target_w, target_h))
+
+    # 3. 影の除去・背景純白化処理
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 平滑化して背景の影を取得
+    dilated = cv2.dilate(gray, np.ones((7,7), np.uint8))
+    bg_img = cv2.medianBlur(dilated, 21)
+    diff_img = 255 - cv2.absdiff(gray, bg_img)
+    norm_img = cv2.normalize(diff_img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+    
+    # 彩度を戻してRGB画像に変換
+    result = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2RGB)
+    return Image.fromarray(result)
+
 if uploaded_file is not None:
-    image = Image.open(uploaded_file)
+    image_bytes = uploaded_file.read()
+    image = Image.open(io.BytesIO(image_bytes))
 
     col1, col2 = st.columns(2)
 
@@ -62,41 +95,35 @@ if uploaded_file is not None:
             st.warning("⚠️ サイドバーに Gemini API Key を入力してください。")
         else:
             if st.button("AIでプリントをリセット実行", type="primary"):
-                with st.spinner("AIが処理中..."):
+                with st.spinner("AIが解析・画像処理中..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         
-                        # response_mime_type を指定せずに呼び出し
+                        # Geminiで領域解析 (JSON出力)
                         response = client.models.generate_content(
                             model="gemini-3.6-flash",
-                            contents=[image, PROMPT]
+                            contents=[image, ANALYSIS_PROMPT],
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json"
+                            )
                         )
 
-                        # インラインデータ（画像データ）が含まれているか抽出
-                        output_image = None
-                        if response.candidates and response.candidates[0].content.parts:
-                            for part in response.candidates[0].content.parts:
-                                if part.inline_data:
-                                    output_image = Image.open(io.BytesIO(part.inline_data.data))
-                                    break
+                        # OpenCVで加工処理
+                        output_image = process_document(image_bytes, response.text)
+
+                        st.image(output_image, use_container_width=True)
                         
-                        if output_image:
-                            st.image(output_image, use_container_width=True)
-                            
-                            buf = io.BytesIO()
-                            output_image.save(buf, format="PNG")
-                            byte_im = buf.getvalue()
-                            
-                            st.download_button(
-                                label="処理後の画像をダウンロード",
-                                data=byte_im,
-                                file_name="print_reset_a4.png",
-                                mime="image/png",
-                            )
-                        else:
-                            st.warning("画像は出力されませんでした（テキスト応答のみ）。")
-                            if response.text:
-                                st.write(response.text)
+                        # ダウンロード用バイト変換
+                        buf = io.BytesIO()
+                        output_image.save(buf, format="PNG")
+                        byte_im = buf.getvalue()
+                        
+                        st.download_button(
+                            label="処理後の画像をダウンロード",
+                            data=byte_im,
+                            file_name="print_reset_a4.png",
+                            mime="image/png",
+                        )
 
                     except Exception as e:
                         st.error(f"エラーが発生しました: {e}")
