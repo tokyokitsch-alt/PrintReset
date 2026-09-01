@@ -68,7 +68,7 @@ if uploaded_file is not None:
                         
                         # response_mime_type を指定せずに呼び出し
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.6-flash",
                             contents=[image, PROMPT]
                         )
 
