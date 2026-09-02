@@ -118,8 +118,9 @@ if uploaded_file is not None:
                     try:
                         client = genai.Client(api_key=api_key)
                         
+                        # 変更後（リトライ回数を5回、待機時間を指数関数的に増加）
                         response = None
-                        max_retries = 3
+                        max_retries = 5
                         for attempt in range(max_retries):
                             try:
                                 response = client.models.generate_content(
@@ -132,7 +133,8 @@ if uploaded_file is not None:
                                 break
                             except Exception as api_err:
                                 if "503" in str(api_err) and attempt < max_retries - 1:
-                                    time.sleep(2)
+                                    wait_time = (attempt + 1) * 3  # 3秒、6秒、9秒...と待機時間を延ばす
+                                    time.sleep(wait_time)
                                     continue
                                 else:
                                     raise api_err
