@@ -12,9 +12,9 @@ from google.genai import types
 st.set_page_config(page_title="PrintReset", layout="wide")
 
 st.title("PrintReset 📄✨")
-st.write("AI (Gemini) が手書き位置と歪みを解析し、OpenCVでA4プリントにきれい復元します。")
+st.write("AI (Gemini) が手書き位置と歪みを解析し、スキャナ品質のA4プリントにリセットします。")
 
-# サイドバー
+# サイドバー設定
 st.sidebar.header("設定")
 api_key = st.sidebar.text_input(
     "Gemini API Key", 
@@ -33,11 +33,11 @@ uploaded_file = st.file_uploader(
 )
 
 ANALYSIS_PROMPT = """
-Analyze this document image and return a JSON object with two fields:
-1. "corners": Normalized coordinates [y, x] scaled from 0 to 1000 for the 4 corners of the main worksheet page in order: [top-left, top-right, bottom-right, bottom-left].
-2. "handwriting_boxes": A list of bounding boxes [ymin, xmin, ymax, xmax] (scaled 0-1000) around ALL handwritten text, pencil marks, red/blue pen annotations, and manual drawings. Do NOT include original printed text, printed lines, or printed tables.
+Analyze this image of a school worksheet/test and return a JSON object with two fields:
+1. "corners": Normalized coordinates [y, x] scaled from 0 to 1000 for the 4 outer corners of the main page in exact order: [top-left, top-right, bottom-right, bottom-left].
+2. "handwriting_boxes": A list of bounding boxes [ymin, xmin, ymax, xmax] (scaled 0-1000) for ALL handwritten pencil marks, student answers, red/blue pen teacher corrections, and manual drawings. Ensure NOT to include printed questions, printed kanji, or printed borders.
 
-Return ONLY valid JSON matching the requested structure.
+Return ONLY valid JSON.
 """
 
 def process_document(image_bytes, json_response):
@@ -46,34 +46,57 @@ def process_document(image_bytes, json_response):
     h, w, _ = img.shape
 
     data = json.loads(json_response)
-    
-    # 1. 手書き文字部分を白で塗りつぶし
+
+    # --- 1. 手書き部分のインペイント（修復消去）マスク作成 ---
+    inpaint_mask = np.zeros((h, w), dtype=np.uint8)
     boxes = data.get("handwriting_boxes", [])
+    
     for box in boxes:
         ymin, xmin, ymax, xmax = box
-        pt1 = (int(xmin * w / 1000), int(ymin * h / 1000))
-        pt2 = (int(xmax * w / 1000), int(ymax * h / 1000))
-        cv2.rectangle(img, pt1, pt2, (255, 255, 255), -1)
+        # 15%マージンを持たせてはみ出しを防止
+        pad_y = int((ymax - ymin) * 0.15)
+        pad_x = int((xmax - xmin) * 0.15)
+        
+        y1 = max(0, int((ymin - pad_y) * h / 1000))
+        x1 = max(0, int((xmin - pad_x) * w / 1000))
+        y2 = min(h, int((ymax + pad_y) * h / 1000))
+        x2 = min(w, int((xmax + pad_x) * w / 1000))
+        
+        # 指定領域内の薄い鉛筆・カラー線（濃い黒の印刷線以外）をピンポイント抽出
+        roi = img[y1:y2, x1:x2]
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # 二値化で手書き跡を抽出 (閾値を調整して枠線破壊を防止)
+        _, roi_mask = cv2.threshold(gray_roi, 190, 255, cv2.THRESH_BINARY_INV)
+        inpaint_mask[y1:y2, x1:x2] = cv2.bitwise_or(inpaint_mask[y1:y2, x1:x2], roi_mask)
 
-    # 2. 台形補正 (Perspective Transform)
+    # インペイントで背景になじませて消去
+    cleaned = cv2.inpaint(img, inpaint_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+    # --- 2. 台形補正 (A4縦サイズ 1:1.414 にジャストフィット) ---
     corners = data.get("corners", [])
     if len(corners) == 4:
         pts1 = np.float32([[c[1] * w / 1000, c[0] * h / 1000] for c in corners])
-        target_w, target_h = 1240, 1754
+        target_w, target_h = 1240, 1754  # A4標準ピクセルサイズ
         pts2 = np.float32([[0, 0], [target_w, 0], [target_w, target_h], [0, target_h]])
         
         M = cv2.getPerspectiveTransform(pts1, pts2)
-        img = cv2.warpPerspective(img, M, (target_w, target_h))
+        cleaned = cv2.warpPerspective(cleaned, M, (target_w, target_h))
 
-    # 3. 影の除去・背景純白化処理
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    dilated = cv2.dilate(gray, np.ones((7,7), np.uint8))
-    bg_img = cv2.medianBlur(dilated, 21)
-    diff_img = 255 - cv2.absdiff(gray, bg_img)
-    norm_img = cv2.normalize(diff_img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+    # --- 3. 純白化＆印刷クッキリ化 (スキャナ風処理) ---
+    gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
     
-    result = cv2.cvtColor(norm_img, cv2.COLOR_GRAY2RGB)
-    return Image.fromarray(result)
+    # アダプティブ処理で陰影を飛ばして背景を完全純白に
+    bg = cv2.medianBlur(gray, 25)
+    diff = cv2.absdiff(gray, bg)
+    normalized = 255 - diff
+    
+    # コントラストを強調して印刷文字をクリアな黒にする
+    _, result_thresh = cv2.threshold(normalized, 230, 255, cv2.THRESH_TRUNC)
+    final_img = cv2.normalize(result_thresh, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+
+    final_rgb = cv2.cvtColor(final_img, cv2.COLOR_GRAY2RGB)
+    return Image.fromarray(final_rgb)
 
 if uploaded_file is not None:
     image_bytes = uploaded_file.read()
@@ -91,11 +114,10 @@ if uploaded_file is not None:
             st.warning("⚠️ サイドバーに Gemini API Key を入力してください。")
         else:
             if st.button("AIでプリントをリセット実行", type="primary"):
-                with st.spinner("AIが解析・画像処理中..."):
+                with st.spinner("スキャナ品質で手書き消去・レイアウト補正中..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         
-                        # 503エラー（過負荷）対策の自動リトライ処理 (最大3回)
                         response = None
                         max_retries = 3
                         for attempt in range(max_retries):
@@ -110,12 +132,11 @@ if uploaded_file is not None:
                                 break
                             except Exception as api_err:
                                 if "503" in str(api_err) and attempt < max_retries - 1:
-                                    time.sleep(2)  # 2秒待機してリトライ
+                                    time.sleep(2)
                                     continue
                                 else:
                                     raise api_err
 
-                        # OpenCV加工処理
                         output_image = process_document(image_bytes, response.text)
 
                         st.image(output_image, use_container_width=True)
